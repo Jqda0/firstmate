@@ -26,6 +26,7 @@ fm_git_identity fmtest fmtest@example.com
 TMP_ROOT=$(fm_test_tmproot fm-install-tests)
 REAL_PATH=$PATH
 REAL_GIT=$(command -v git)
+REAL_DATE=$(command -v date)
 
 # --- shared fixtures ----------------------------------------------------------
 
@@ -139,22 +140,31 @@ SH
   git clone -q --bare "$work" "$TMP_ROOT/upstream.git"
 }
 
-# The nodejs.org downloads the stub curl serves: a release index, a tarball with
-# stub node and npm, and the published checksum list.
+# The nodejs.org downloads the stub curl serves: a release index, tarballs with
+# stub node and npm, and the published checksum list. The newest LTS (26) has no
+# 32-bit ARM build, as on the real index, so armv7l resolves to the 22 line.
 build_node_fixtures() {
-  local dir=$TMP_ROOT/nodefix pack=$TMP_ROOT/nodefix/pack/node-v26.13.0-linux-x64
-  mkdir -p "$pack/bin"
-  printf '#!/bin/sh\necho v26.13.0\n' > "$pack/bin/node"
-  write_tool_template "$pack/bin/npm"
-  printf '#!/bin/sh\nexit 0\n' > "$pack/bin/npx"
-  chmod +x "$pack/bin/node" "$pack/bin/npx"
-  tar -czf "$dir/node-v26.13.0-linux-x64.tar.gz" -C "$dir/pack" node-v26.13.0-linux-x64
-  printf '%s  node-v26.13.0-linux-x64.tar.gz\n' "$(sha256_of "$dir/node-v26.13.0-linux-x64.tar.gz")" > "$dir/SHASUMS256.txt"
+  local dir=$TMP_ROOT/nodefix name ver arch pack
+  mkdir -p "$dir"
+  : > "$dir/SHASUMS256.txt"
+  for name in "v26.13.0 x64" "v26.13.0 arm64" "v22.23.4 armv7l"; do
+    ver=${name% *}
+    arch=${name#* }
+    pack=$dir/pack/node-$ver-linux-$arch
+    mkdir -p "$pack/bin"
+    printf '#!/bin/sh\necho %s\n' "$ver" > "$pack/bin/node"
+    write_tool_template "$pack/bin/npm"
+    printf '#!/bin/sh\nexit 0\n' > "$pack/bin/npx"
+    chmod +x "$pack/bin/node" "$pack/bin/npx"
+    tar -czf "$dir/node-$ver-linux-$arch.tar.gz" -C "$dir/pack" "node-$ver-linux-$arch"
+    printf '%s  node-%s-linux-%s.tar.gz\n' "$(sha256_of "$dir/node-$ver-linux-$arch.tar.gz")" "$ver" "$arch" >> "$dir/SHASUMS256.txt"
+  done
   cat > "$dir/index.json" <<'EOF'
 [
-{"version":"v27.0.0-alpha.0.0.0","date":"2026-10-29","files":["linux-x64"],"lts":false,"security":false},
-{"version":"v26.13.0","date":"2026-10-28","files":["linux-x64"],"lts":"Lithium","security":false},
-{"version":"v24.22.2","date":"2026-10-27","files":["linux-x64"],"lts":"Krypton","security":false}
+{"version":"v27.0.0-alpha.0.0.0","date":"2026-10-29","files":["linux-arm64","linux-x64"],"lts":false,"security":false},
+{"version":"v26.13.0","date":"2026-10-28","files":["linux-arm64","linux-x64"],"lts":"Lithium","security":false},
+{"version":"v24.22.2","date":"2026-10-27","files":["linux-arm64","linux-x64"],"lts":"Krypton","security":false},
+{"version":"v22.23.4","date":"2026-10-20","files":["linux-arm64","linux-armv7l","linux-x64"],"lts":"Jod","security":false}
 ]
 EOF
 }
@@ -274,6 +284,12 @@ SH
 . "$FM_TEST_W/stubs/pkglib.sh"
 echo "apt-get $*" >> "$FM_TEST_LOG"
 case "${1:-}" in
+  update)
+    if [ -n "${FAKE_APT_UPDATE_FAIL:-}" ]; then
+      echo "$FAKE_APT_UPDATE_FAIL" >&2
+      exit 100
+    fi
+    ;;
   install)
     shift
     for a in "$@"; do
@@ -354,27 +370,54 @@ exit 0
 SH
   cat > "$s/curl" <<'SH'
 #!/bin/sh
-echo "curl $*" >> "$FM_TEST_LOG"
 out=''
 url=''
+insecure=''
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out=$2; shift ;;
+    --max-time) shift ;;
+    --insecure) insecure='insecure ' ;;
     -*) ;;
     *) url=$1 ;;
   esac
   shift
 done
+case "$url" in
+  https://github.com)
+    echo "curl-head $insecure$url" >> "$FM_TEST_LOG"
+    [ "${FAKE_GITHUB_OFFLINE:-0}" != 1 ] || exit 6
+    # A clock far behind fails certificate verification, as curl exit 60.
+    if [ "${FAKE_CERT_FAIL:-0}" = 1 ] && [ -z "$insecure" ]; then exit 60; fi
+    d=${FAKE_HTTP_DATE:-$("$FM_TEST_REAL_DATE" -u '+%a, %d %b %Y %H:%M:%S GMT')}
+    printf 'HTTP/2 200\r\ndate: %s\r\nserver: GitHub.com\r\n\r\n' "$d"
+    exit 0
+    ;;
+esac
+echo "curl -fsSL $url -o $out" >> "$FM_TEST_LOG"
 src=''
 case "$url" in
-  https://nodejs.org/dist/index.json) src=$FM_TEST_NODEFIX/index.json ;;
+  https://nodejs.org/dist/index.json) src=${FAKE_INDEX_FILE:-$FM_TEST_NODEFIX/index.json} ;;
   https://nodejs.org/dist/*/SHASUMS256.txt) src=${FAKE_SHASUMS:-$FM_TEST_NODEFIX/SHASUMS256.txt} ;;
-  https://nodejs.org/dist/*/node-*-linux-*.tar.gz) src=$FM_TEST_NODEFIX/node-v26.13.0-linux-x64.tar.gz ;;
+  https://nodejs.org/dist/*/node-*-linux-*.tar.gz) src=$FM_TEST_NODEFIX/${url##*/} ;;
   https://cli.github.com/*) src=$FM_TEST_W/tool-template ;;
   *) exit 22 ;;
 esac
 [ -n "$out" ] || { cat "$src"; exit 0; }
 cp "$src" "$out"
+SH
+  cat > "$s/date" <<'SH'
+#!/bin/sh
+if [ -n "${FAKE_DATE_NOW:-}" ] && [ "${1:-}" = -u ]; then
+  echo "$FAKE_DATE_NOW"
+  exit 0
+fi
+exec "$FM_TEST_REAL_DATE" "$@"
+SH
+  cat > "$s/getconf" <<'SH'
+#!/bin/sh
+[ "${1:-}" = LONG_BIT ] && echo "${FAKE_LONG_BIT:-64}"
+exit 0
 SH
   chmod +x "$s"/*
   chmod -x "$s/pkglib.sh"
@@ -395,7 +438,7 @@ run_installer() {
   local pathv="$W/stubs:$W/inst:$W/basic"
   local envs=(-u FM_HOME -u FM_INSTALL_YES -u FM_INSTALL_DIR -u FM_INSTALL_REPO -u FM_INSTALL_TTY -u GIT_TERMINAL_PROMPT
     "PATH=$pathv" "HOME=$W/home" "TMPDIR=$W/tmp" "FM_TEST_W=$W" "FM_TEST_LOG=$W/log"
-    "FM_TEST_NODEFIX=$TMP_ROOT/nodefix" "FM_TEST_REAL_GIT=$REAL_GIT"
+    "FM_TEST_NODEFIX=$TMP_ROOT/nodefix" "FM_TEST_REAL_GIT=$REAL_GIT" "FM_TEST_REAL_DATE=$REAL_DATE"
     "FM_INSTALL_REPO=$TMP_ROOT/upstream.git" "FM_INSTALL_TTY=$W/no-tty")
   if [ "${#RUN_ENV[@]}" -gt 0 ]; then
     envs+=("${RUN_ENV[@]}")
@@ -969,6 +1012,159 @@ test_next_steps_name_the_agents_that_are_installed() {
   pass "next steps give the README's launch command for each installed agent"
 }
 
+# --- a wrong clock ----------------------------------------------------------------
+
+# A Raspberry Pi with no battery clock: 28h50m behind real time.
+w_skewed() {
+  w_ubuntu "$1"
+  w_env "FAKE_DATE_NOW=2026 10 29 11 00 00" "FAKE_HTTP_DATE=Fri, 30 Oct 2026 15:50:00 GMT"
+}
+
+test_clock_skew_is_measured_and_warned_about() {
+  w_skewed skew-dry
+  run_installer --dry-run
+  expect_code 0 "$RC" "a dry run only warns:"$'\n'"$OUT"
+  assert_contains "$OUT" "Clock check: this machine's clock is 1d 4h 50min behind github.com (this machine says 2026-10-29 11:00:00 UTC, github.com says 2026-10-30 15:50:00 UTC)." "the plan states the measured difference and its direction"
+  assert_contains "$OUT" "sudo timedatectl set-ntp true" "the plan names the systemd fix"
+  assert_contains "$OUT" 'System clock synchronized: yes' "the plan says what to check afterwards"
+  assert_contains "$OUT" "Without systemd, set the date and time by hand." "the plan covers machines without systemd"
+  assert_contains "$OUT" "Dry run: nothing was changed." "dry-run carries on to its normal ending"
+  assert_equals "" "$(mutating_calls)" "the dry run ran nothing"
+  w_ubuntu skew-ahead
+  w_env "FAKE_DATE_NOW=2026 10 31 15 50 00" "FAKE_HTTP_DATE=Fri, 30 Oct 2026 15:50:00 GMT"
+  run_installer --dry-run
+  assert_contains "$OUT" "this machine's clock is 1d ahead github.com" "a clock that runs ahead is reported too"
+  w_ubuntu skew-small
+  w_env "FAKE_DATE_NOW=2026 10 30 15 46 00" "FAKE_HTTP_DATE=Fri, 30 Oct 2026 15:50:00 GMT"
+  run_installer --dry-run
+  assert_not_contains "$OUT" "Clock check" "a four minute difference is not worth a warning"
+  w_ubuntu skew-limit
+  w_env "FAKE_DATE_NOW=2026 10 30 15 44 00" "FAKE_HTTP_DATE=Fri, 30 Oct 2026 15:50:00 GMT"
+  run_installer --dry-run
+  assert_contains "$OUT" "Clock check: this machine's clock is 6min behind github.com" "six minutes is over the five minute limit"
+  w_skewed skew-cert
+  w_env FAKE_CERT_FAIL=1
+  run_installer --dry-run
+  assert_contains "$OUT" "Clock check: this machine's clock is 1d 4h 50min behind" "a clock too wrong for certificate checks is still measured, by reading only the Date header"
+  assert_grep "curl-head insecure https://github.com" "$W/log" "the retry that skips verification is the one that measured it"
+  w_ubuntu skew-noop
+  w_base
+  w_env FAKE_BOOTSTRAP_TOOLS="" "FAKE_DATE_NOW=2026 10 29 11 00 00" "FAKE_HTTP_DATE=Fri, 30 Oct 2026 15:50:00 GMT"
+  git clone -q "$TMP_ROOT/upstream.git" "$W/home/firstmate"
+  run_installer --yes
+  assert_not_contains "$OUT" "Clock check" "a plan with nothing to download is not held up by the clock"
+  assert_no_grep "curl-head" "$W/log" "and the clock is not even measured"
+  pass "a clock more than five minutes off is measured and named in the plan"
+}
+
+test_a_real_run_stops_and_asks_when_the_clock_is_wrong() {
+  w_skewed skew-no
+  printf 'n\n' > "$W/tty"
+  w_env "FM_INSTALL_TTY=$W/tty"
+  run_installer
+  expect_code 1 "$RC" "declining exits non-zero"
+  assert_contains "$OUT" "The clock looks wrong (see above). Run these steps anyway? [y/N]" "it asks, and names the reason"
+  assert_not_contains "$OUT" "Run these steps now?" "the clock question replaces the plan question"
+  assert_contains "$OUT" "Nothing was changed." "declining changes nothing"
+  assert_equals "" "$(mutating_calls)" "a declined plan ran nothing"
+  w_skewed skew-empty
+  printf '\n' > "$W/tty"
+  w_env "FM_INSTALL_TTY=$W/tty"
+  run_installer --yes
+  expect_code 1 "$RC" "the default answer is no, even with --yes"
+  assert_equals "" "$(mutating_calls)" "an empty answer ran nothing"
+  w_skewed skew-yes
+  printf 'y\nn\n' > "$W/tty"
+  w_env "FM_INSTALL_TTY=$W/tty"
+  run_installer
+  expect_code 0 "$RC" "agreeing goes ahead:"$'\n'"$OUT"
+  assert_grep "apt-get install -y" "$W/log" "the plan ran after the answer"
+  w_skewed skew-no-terminal
+  run_installer --yes
+  expect_code 1 "$RC" "no terminal and a wrong clock stops, even with --yes"
+  assert_contains "$OUT" "There is no terminal to ask on and the clock looks wrong, so nothing was changed." "it says why"
+  assert_contains "$OUT" "FM_INSTALL_IGNORE_CLOCK=1" "it names the override"
+  assert_equals "" "$(mutating_calls)" "nothing ran"
+  w_skewed skew-ignored
+  w_env FM_INSTALL_IGNORE_CLOCK=1
+  run_installer --yes
+  expect_code 0 "$RC" "the override goes ahead:"$'\n'"$OUT"
+  assert_contains "$OUT" "Clock check:" "the warning is still printed"
+  pass "a real run stops and asks, default no, when the clock is wrong"
+}
+
+test_a_clock_check_that_cannot_run_never_blocks() {
+  w_ubuntu skew-offline
+  w_env FAKE_GITHUB_OFFLINE=1
+  run_installer --yes
+  expect_code 0 "$RC" "an unreachable github.com does not stop the install:"$'\n'"$OUT"
+  assert_not_contains "$OUT" "Clock check" "no warning without a measurement"
+  w_ubuntu skew-garbage
+  w_env "FAKE_HTTP_DATE=not a date at all"
+  run_installer --yes
+  expect_code 0 "$RC" "an unreadable Date header does not stop the install:"$'\n'"$OUT"
+  assert_not_contains "$OUT" "Clock check" "no warning without a reading"
+  w_ubuntu skew-no-curl
+  rm -f "$W/inst/curl"
+  w_env "FAKE_DATE_NOW=2026 10 29 11 00 00" "FAKE_HTTP_DATE=Fri, 30 Oct 2026 15:50:00 GMT"
+  run_installer --dry-run
+  assert_not_contains "$OUT" "Clock check" "without curl there is nothing to measure with"
+  pass "a clock check that cannot run is silent and never blocks"
+}
+
+test_a_package_failure_about_the_clock_gets_a_hint() {
+  w_ubuntu apt-clock
+  w_env "FAKE_APT_UPDATE_FAIL=E: Release file for http://security.debian.org/debian-security/dists/bookworm-security/InRelease is not valid yet (invalid for another 1d 4h 50min). Updates for this repository will not be applied."
+  run_installer --yes
+  [ "$RC" -ne 0 ] || fail "a failing apt-get update must fail the install"
+  assert_contains "$OUT" "install.sh: stopped during: Refresh the package index: apt-get update" "the existing message is kept"
+  assert_contains "$OUT" "Nothing is left half-done that a re-run cannot repair" "the existing reassurance is kept"
+  assert_contains "$OUT" "is not valid yet (invalid for another 1d 4h 50min)" "apt's own error is still shown"
+  assert_contains "$OUT" 'says something is "not valid yet", which almost always means this machine'"'"'s clock is behind real time' "the hint explains the error"
+  assert_contains "$OUT" "sudo timedatectl set-ntp true" "the hint names the fix"
+  w_ubuntu apt-other
+  w_env "FAKE_APT_UPDATE_FAIL=E: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/noble/InRelease  Temporary failure resolving 'archive.ubuntu.com'"
+  run_installer --yes
+  [ "$RC" -ne 0 ] || fail "a failing apt-get update must fail the install"
+  assert_contains "$OUT" "install.sh: stopped during: Refresh the package index: apt-get update" "the message is the same for any failure"
+  assert_not_contains "$OUT" "not valid yet" "an unrelated failure gets no clock hint"
+  assert_not_contains "$OUT" "timedatectl" "and no clock fix"
+  pass "a package-manager failure that mentions the clock gets the clock hint"
+}
+
+test_32_bit_arm_is_supported_or_refused_clearly() {
+  w_ubuntu arm32
+  w_env FAKE_UNAME_M=armv7l
+  run_installer --yes
+  expect_code 0 "$RC" "armv7l installs:"$'\n'"$OUT"
+  assert_contains "$OUT" "the newest Node.js LTS that nodejs.org builds for 32-bit ARM" "the plan says which build it takes"
+  assert_grep "node-v22.23.4-linux-armv7l.tar.gz" "$W/log" "it took the newest LTS that has an armv7l build, not the newest LTS"
+  assert_equals "v22.23.4" "$(PATH="$W/home/.local/bin:$PATH" "$W/home/.local/bin/node" --version)" "that node is the one linked"
+  w_ubuntu arm32-on-arm64-kernel
+  w_env FAKE_UNAME_M=aarch64 FAKE_LONG_BIT=32
+  run_installer --yes
+  expect_code 0 "$RC" "a 64-bit kernel with a 32-bit userland installs the 32-bit build:"$'\n'"$OUT"
+  assert_grep "node-v22.23.4-linux-armv7l.tar.gz" "$W/log" "aarch64 over a 32-bit userland is treated as armv7l"
+  w_ubuntu arm64-userland
+  w_env FAKE_UNAME_M=aarch64
+  run_installer --yes
+  assert_grep "node-v26.13.0-linux-arm64.tar.gz" "$W/log" "a 64-bit userland keeps the arm64 build"
+  w_ubuntu arm-v6
+  w_env FAKE_UNAME_M=armv6l
+  run_installer --yes
+  expect_code 1 "$RC" "armv6l is refused"
+  assert_contains "$OUT" "nodejs.org has no Node.js 22.19.0 or newer build for armv6l (Raspberry Pi Zero and 1)" "it names the architecture and the boards"
+  assert_equals "" "$(mutating_calls)" "it refused before changing anything"
+  w_ubuntu arm32-no-build
+  w_env FAKE_UNAME_M=armv7l "FAKE_INDEX_FILE=$W/index-no-arm32.json"
+  grep -v 'linux-armv7l' "$TMP_ROOT/nodefix/index.json" > "$W/index-no-arm32.json"
+  run_installer --yes
+  [ "$RC" -ne 0 ] || fail "an index with no armv7l build must fail the install"
+  assert_contains "$OUT" "nodejs.org lists no LTS Node.js build for linux-armv7l (this CPU is armv7l)" "it names the architecture"
+  assert_contains "$OUT" "install node 22.19.0 or newer yourself and run this again" "it says what to do"
+  pass "32-bit ARM installs the newest LTS that has a build, or says plainly that none exists"
+}
+
 test_script_runs_under_every_posix_shell() {
   w_ubuntu shells
   INTERP=/bin/sh
@@ -1061,5 +1257,10 @@ fm_test_run \
   test_sign_in_is_offered_on_a_terminal \
   test_path_line_is_printed_and_startup_files_are_not_edited \
   test_next_steps_name_the_agents_that_are_installed \
+  test_clock_skew_is_measured_and_warned_about \
+  test_a_real_run_stops_and_asks_when_the_clock_is_wrong \
+  test_a_clock_check_that_cannot_run_never_blocks \
+  test_a_package_failure_about_the_clock_gets_a_hint \
+  test_32_bit_arm_is_supported_or_refused_clearly \
   test_script_runs_under_every_posix_shell \
   test_prompt_uses_the_controlling_terminal

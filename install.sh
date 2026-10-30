@@ -23,6 +23,12 @@
 # line instead), and never discards anything in an existing clone. A re-run on a
 # finished install changes nothing and says so.
 #
+# Clock: before the plan it compares this machine's clock with github.com's. A
+# clock more than five minutes off (a Raspberry Pi that has not synced) makes
+# package indexes and downloads fail with "not valid yet" errors, so the plan
+# says so and a real run stops and asks, default no, instead of starting.
+# --dry-run only warns, and a check that cannot run never blocks.
+#
 # Options:
 #   -y, --yes       accept the plan without asking (also FM_INSTALL_YES=1)
 #   -n, --dry-run   print the plan and run nothing
@@ -34,6 +40,7 @@
 #   FM_INSTALL_DIR=PATH    same as --dir
 #   FM_INSTALL_REPO=URL    repository to clone (default: the upstream HTTPS URL)
 #   FM_INSTALL_TTY=PATH    terminal to ask on and sign in with (default: /dev/tty)
+#   FM_INSTALL_IGNORE_CLOCK=1  go ahead without asking when the clock looks wrong
 #
 # Exit status: 0 when the install is complete or the plan was only previewed;
 # non-zero when the platform is unsupported, a step failed, the plan was not
@@ -53,7 +60,10 @@ REPO_URL="${FM_INSTALL_REPO:-https://github.com/kunchenguid/firstmate.git}"
 INSTALL_DIR="${FM_INSTALL_DIR:-}"
 ASSUME_YES="${FM_INSTALL_YES:-0}"
 TTY_DEVICE="${FM_INSTALL_TTY:-/dev/tty}"
+IGNORE_CLOCK="${FM_INSTALL_IGNORE_CLOCK:-0}"
 DRY_RUN=0
+# Seconds this machine's clock may differ from github.com's before the plan warns.
+CLOCK_LIMIT=300
 
 # Tools the base layer owns. bin/fm-bootstrap.sh reports some of these too; the
 # installer filters them out of the toolchain list because it installs them.
@@ -61,6 +71,9 @@ BASE_TOOLS="node git gh tmux jq curl ps"
 
 STEPS=''
 STEP_COUNT=0
+NET_STEPS=0
+CLOCK_SKEWED=0
+CLOCK_NOTE=''
 CURRENT_STEP=''
 WORK=''
 TTY_OPEN=0
@@ -102,20 +115,34 @@ Options:
       --dir PATH  where the clone goes (default: $HOME/firstmate)
   -h, --help      print this help
 
-Environment: FM_INSTALL_YES, FM_INSTALL_DIR, FM_INSTALL_REPO, FM_INSTALL_TTY.
+Environment: FM_INSTALL_YES, FM_INSTALL_DIR, FM_INSTALL_REPO, FM_INSTALL_TTY,
+FM_INSTALL_IGNORE_CLOCK.
 EOF
 }
 
 on_exit() {
   rc=$?
-  if [ -n "$WORK" ]; then
-    rm -rf "$WORK"
-  fi
   if [ "$rc" -ne 0 ] && [ -n "$CURRENT_STEP" ]; then
     warn ""
     warn "install.sh: stopped during: $CURRENT_STEP"
     warn "Nothing is left half-done that a re-run cannot repair: fix the problem above and run the installer again."
+    if [ -n "$WORK" ] && grep -Ei 'not valid yet|not yet valid' "$WORK/last.out" >/dev/null 2>&1; then
+      warn ""
+      warn "The output above says something is \"not valid yet\", which almost always means this machine's clock is behind real time."
+      clock_fix >&2
+    fi
   fi
+  if [ -n "$WORK" ]; then
+    rm -rf "$WORK"
+  fi
+}
+
+# How to repair a wrong clock, shared by the plan's warning and the failure hint.
+clock_fix() {
+  printf '%s\n' \
+    "Fix the clock first. On a systemd machine run: sudo timedatectl set-ntp true" \
+    "then check that timedatectl status shows \"System clock synchronized: yes\". Without systemd, set the date and time by hand." \
+    "Then run this installer again."
 }
 
 ensure_work() {
@@ -124,10 +151,13 @@ ensure_work() {
   fi
 }
 
-# Echo a command before running it, so no step is ever silent about what it does.
+# Echo a command before running it, so no step is ever silent about what it does,
+# and keep a copy of its output for the failure hint in on_exit.
 run() {
   printf '    $ %s\n' "$*"
-  "$@"
+  ensure_work
+  { "$@" 2>&1 && printf 0 > "$WORK/rc" || printf 1 > "$WORK/rc"; } | tee "$WORK/last.out"
+  [ "$(cat "$WORK/rc")" = 0 ]
 }
 
 # Run a command as root: directly when already root, otherwise through sudo,
@@ -219,6 +249,26 @@ add_step() {
   if [ "$1" = 1 ]; then
     SUDO_STEPS=$((SUDO_STEPS + 1))
   fi
+  if [ "$2" != step_npm_prefix ]; then
+    NET_STEPS=$((NET_STEPS + 1))
+  fi
+}
+
+# The nodejs.org name for this machine's CPU, or nothing when it has no build.
+# A 64-bit kernel under a 32-bit userland (common on Raspberry Pi OS) reports
+# aarch64, but only a 32-bit ARM build runs there.
+node_arch() {
+  case "$ARCH" in
+    x86_64|amd64) printf 'x64' ;;
+    aarch64|arm64)
+      if [ "$(getconf LONG_BIT 2>/dev/null)" = 32 ]; then
+        printf 'armv7l'
+      else
+        printf 'arm64'
+      fi
+      ;;
+    armv7l|armv8l) printf 'armv7l' ;;
+  esac
 }
 
 parse_args() {
@@ -309,6 +359,82 @@ toolchain_missing() {
 bootstrap_detect() {
   FM_HOME="$INSTALL_DIR" FM_BOOTSTRAP_DETECT_ONLY=1 FM_BOOTSTRAP_NETWORK=skip \
     "$INSTALL_DIR/bin/fm-bootstrap.sh" 2>&1 || true
+}
+
+# Whole seconds as "1d 4h 50min", the way apt words a clock error.
+fmt_span() {
+  fs_s=$1
+  fs_out=''
+  fs_d=$((fs_s / 86400))
+  fs_h=$(((fs_s % 86400) / 3600))
+  fs_m=$(((fs_s % 3600) / 60))
+  if [ "$fs_d" -gt 0 ]; then fs_out="${fs_d}d"; fi
+  if [ "$fs_h" -gt 0 ]; then fs_out="$fs_out ${fs_h}h"; fi
+  if [ "$fs_m" -gt 0 ]; then fs_out="$fs_out ${fs_m}min"; fi
+  if [ -z "$fs_out" ]; then fs_out="${fs_s}s"; fi
+  printf '%s' "${fs_out# }"
+}
+
+# "<seconds this clock is ahead>|<github.com UTC>|<local UTC>" from the Date
+# header of a HEAD request, or nothing when it cannot be measured. The header is
+# turned into an epoch with awk, so it needs no GNU or BSD date option. A badly
+# wrong clock fails the HTTPS certificate check itself ("certificate is not yet
+# valid"), so the retry skips verification: only the Date header is read, and
+# nothing else from that response is trusted or used.
+clock_skew_report() {
+  have curl || return 0
+  cs_hdr=$(curl -fsSI --max-time 10 https://github.com 2>/dev/null || curl -fsSI --insecure --max-time 10 https://github.com 2>/dev/null || true)
+  [ -n "$cs_hdr" ] || return 0
+  cs_local=$(date -u '+%Y %m %d %H %M %S' 2>/dev/null || true)
+  [ -n "$cs_local" ] || return 0
+  printf '%s\n' "$cs_hdr" | awk -v local="$cs_local" '
+    function days(y, m, d,    era, yoe, doy) {
+      if (m <= 2) y -= 1
+      era = int(y / 400)
+      yoe = y - era * 400
+      doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+      return era * 146097 + yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy - 719468
+    }
+    { sub(/\r$/, "") }
+    tolower($1) == "date:" && NF >= 6 {
+      mon = (index("JanFebMarAprMayJunJulAugSepOctNovDec", $4) + 2) / 3
+      if (mon != int(mon) || mon < 1) exit
+      split($6, T, ":")
+      if (split(local, L, " ") != 6) exit
+      remote = days($5 + 0, mon, $3 + 0) * 86400 + T[1] * 3600 + T[2] * 60 + T[3]
+      mine = days(L[1] + 0, L[2] + 0, L[3] + 0) * 86400 + L[4] * 3600 + L[5] * 60 + L[6]
+      printf "%d|%04d-%02d-%02d %s|%04d-%02d-%02d %02d:%02d:%02d\n", mine - remote, $5, mon, $3, $6, L[1], L[2], L[3], L[4], L[5], L[6]
+      exit
+    }'
+}
+
+# Compare this clock with github.com's before the plan is shown. A clock more
+# than CLOCK_LIMIT seconds off sets CLOCK_SKEWED and a note for the plan; a
+# check that cannot run (offline, no curl, an unreadable header) says nothing.
+check_clock() {
+  CLOCK_SKEWED=0
+  CLOCK_NOTE=''
+  [ "$NET_STEPS" -gt 0 ] || return 0
+  cc_out=$(clock_skew_report) || return 0
+  [ -n "$cc_out" ] || return 0
+  cc_skew=${cc_out%%|*}
+  cc_rest=${cc_out#*|}
+  cc_remote=${cc_rest%%|*}
+  cc_local=${cc_rest#*|}
+  case "$cc_skew" in
+    ''|-|*[!0-9-]*) return 0 ;;
+  esac
+  cc_abs=${cc_skew#-}
+  [ "$cc_abs" -gt "$CLOCK_LIMIT" ] || return 0
+  CLOCK_SKEWED=1
+  if [ "$cc_skew" -lt 0 ]; then
+    cc_dir=behind
+  else
+    cc_dir=ahead
+  fi
+  CLOCK_NOTE="Clock check: this machine's clock is $(fmt_span "$cc_abs") $cc_dir github.com (this machine says $cc_local UTC, github.com says $cc_remote UTC).
+A clock this far off makes package indexes and HTTPS downloads fail, for example with \"Release file ... is not valid yet\".
+$(clock_fix)"
 }
 
 need() {
@@ -425,10 +551,11 @@ detect_and_plan() {
         PKGS="$PKGS nodejs npm"
       else
         NODE_VIA=tarball
+        dt_na=$(node_arch)
         case "$ARCH" in
-          x86_64|amd64|aarch64|arm64) ;;
-          *) die "no Node.js download is selected for this CPU ($ARCH); install node $NODE_MIN or newer yourself and run this again" ;;
+          armv6l) die "nodejs.org has no Node.js $NODE_MIN or newer build for armv6l (Raspberry Pi Zero and 1); install node $NODE_MIN or newer another way and run this again" ;;
         esac
+        [ -n "$dt_na" ] || die "no Node.js download is selected for this CPU ($ARCH); install node $NODE_MIN or newer yourself and run this again"
         for dt_tool in tar gzip; do
           have "$dt_tool" || PKGS="$PKGS $dt_tool"
         done
@@ -491,7 +618,12 @@ detect_and_plan() {
   fi
 
   if [ "$NODE_VIA" = tarball ]; then
-    add_step 0 step_node_tarball "Install the current Node.js LTS from nodejs.org into $NODE_LIB, verified against its published SHASUMS256.txt, and link it in $LOCAL_BIN (no sudo)"
+    if [ "$(node_arch)" = armv7l ]; then
+      dt_nlabel="the newest Node.js LTS that nodejs.org builds for 32-bit ARM"
+    else
+      dt_nlabel="the current Node.js LTS"
+    fi
+    add_step 0 step_node_tarball "Install $dt_nlabel from nodejs.org into $NODE_LIB, verified against its published SHASUMS256.txt, and link it in $LOCAL_BIN (no sudo)"
   fi
   dt_prefix=0
   case "$NODE_VIA" in
@@ -603,6 +735,10 @@ EOF
   fi
   say "No shell startup file is edited; if your PATH needs a line, it is printed at the end."
   say ""
+  if [ "$CLOCK_SKEWED" = 1 ]; then
+    say "$CLOCK_NOTE"
+    say ""
+  fi
 }
 
 sha256_of() {
@@ -711,16 +847,15 @@ step_pkg_install() {
 step_node_tarball() {
   ensure_work
   have tar || die "tar is needed to unpack Node.js and was not found"
-  case "$ARCH" in
-    x86_64|amd64) nt_arch=x64 ;;
-    aarch64|arm64) nt_arch=arm64 ;;
-    *) die "no Node.js download is selected for this CPU ($ARCH)" ;;
-  esac
+  nt_arch=$(node_arch)
+  [ -n "$nt_arch" ] || die "no Node.js download is selected for this CPU ($ARCH)"
   nt_base=https://nodejs.org/dist
   run curl -fsSL "$nt_base/index.json" -o "$WORK/index.json"
-  nt_ver=$(sed -n 's/^{"version":"\(v[0-9][0-9.]*\)".*"lts":"[^"]*".*/\1/p' "$WORK/index.json" | head -n 1)
-  [ -n "$nt_ver" ] || die "could not read the current Node.js LTS version from $nt_base/index.json"
-  version_ge "${nt_ver#v}" "$NODE_MIN" || die "the current Node.js LTS ($nt_ver) is older than the $NODE_MIN firstmate needs"
+  # The newest LTS release that lists a build for this CPU: every LTS line has
+  # x64 and arm64, while 32-bit ARM stopped with Node 22.
+  nt_ver=$(grep '"lts":"' "$WORK/index.json" | grep "\"linux-$nt_arch\"" | head -n 1 | sed -n 's/^{"version":"\(v[0-9][0-9.]*\)".*/\1/p')
+  [ -n "$nt_ver" ] || die "nodejs.org lists no LTS Node.js build for linux-$nt_arch (this CPU is $ARCH); install node $NODE_MIN or newer yourself and run this again"
+  version_ge "${nt_ver#v}" "$NODE_MIN" || die "the newest LTS Node.js build for linux-$nt_arch is $nt_ver, older than the $NODE_MIN firstmate needs (this CPU is $ARCH); install node $NODE_MIN or newer yourself and run this again"
   nt_file="node-$nt_ver-linux-$nt_arch.tar.gz"
   run curl -fsSL "$nt_base/$nt_ver/SHASUMS256.txt" -o "$WORK/SHASUMS256.txt"
   nt_want=$(awk -v f="$nt_file" '$2 == f { print $1; exit }' "$WORK/SHASUMS256.txt")
@@ -983,6 +1118,7 @@ main() {
   PATH="$LOCAL_BIN:$PATH"
   export PATH
   detect_and_plan
+  check_clock
   print_plan
   if [ "$STEP_COUNT" -eq 0 ]; then
     say "Nothing to install: everything is already in place, so nothing was changed."
@@ -995,7 +1131,18 @@ main() {
     say "Dry run: nothing was changed."
     exit 0
   fi
-  if [ "$ASSUME_YES" != 1 ]; then
+  if [ "$CLOCK_SKEWED" = 1 ] && [ "$IGNORE_CLOCK" != 1 ]; then
+    # --yes accepts the plan, not a wrong clock, so this question is asked either way.
+    if ! have_tty; then
+      say "There is no terminal to ask on and the clock looks wrong, so nothing was changed."
+      say "Fix the clock and run this again, or set FM_INSTALL_IGNORE_CLOCK=1 to go ahead anyway."
+      exit 1
+    fi
+    if ! ask "The clock looks wrong (see above). Run these steps anyway?"; then
+      say "Nothing was changed."
+      exit 1
+    fi
+  elif [ "$ASSUME_YES" != 1 ]; then
     if ! have_tty; then
       say "There is no terminal to ask on and --yes was not given, so nothing was changed."
       say "Run this from a terminal, or accept the plan with: curl -fsSL https://raw.githubusercontent.com/kunchenguid/firstmate/main/install.sh | sh -s -- --yes"
