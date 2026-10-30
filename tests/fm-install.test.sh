@@ -1027,7 +1027,13 @@ test_clock_skew_is_measured_and_warned_about() {
   assert_contains "$OUT" "Clock check: this machine's clock is 1d 4h 50min behind github.com (this machine says 2026-10-29 11:00:00 UTC, github.com says 2026-10-30 15:50:00 UTC)." "the plan states the measured difference and its direction"
   assert_contains "$OUT" "sudo timedatectl set-ntp true" "the plan names the systemd fix"
   assert_contains "$OUT" 'System clock synchronized: yes' "the plan says what to check afterwards"
-  assert_contains "$OUT" "Without systemd, set the date and time by hand." "the plan covers machines without systemd"
+  assert_contains "$OUT" "If it does not synchronize, or there is no systemd, set the clock by hand:" "the plan gives a fallback that does not depend on time sync"
+  assert_contains "$OUT" '  sudo date -u -s "2026-10-30 15:50:00"' "the manual command carries the UTC time github.com reported"
+  assert_contains "$OUT" "it is a few seconds old by the time you run it, which does not matter for certificates and package indexes" "the plan says the time is slightly old and why that is fine"
+  assert_contains "$OUT" "  timedatectl timesync-status" "the plan names the first diagnostic"
+  assert_contains "$OUT" "  journalctl -u systemd-timesyncd -n 20 --no-pager" "the plan names the second diagnostic"
+  assert_contains "$OUT" "usually means the network blocks time servers (NTP on UDP port 123) or systemd-timesyncd is missing or not running" "the plan says what a stuck sync usually means"
+  assert_not_contains "$OUT" "curl -sI http://google.com" "with a measurement the exact command replaces the generic one"
   assert_contains "$OUT" "Dry run: nothing was changed." "dry-run carries on to its normal ending"
   assert_equals "" "$(mutating_calls)" "the dry run ran nothing"
   w_ubuntu skew-ahead
@@ -1130,6 +1136,33 @@ test_a_package_failure_about_the_clock_gets_a_hint() {
   assert_not_contains "$OUT" "not valid yet" "an unrelated failure gets no clock hint"
   assert_not_contains "$OUT" "timedatectl" "and no clock fix"
   pass "a package-manager failure that mentions the clock gets the clock hint"
+}
+
+test_the_clock_hint_offers_a_manual_fallback_on_both_paths() {
+  # The failure hint measures again, so its manual command is exact too.
+  w_skewed hint-measured
+  w_env FM_INSTALL_IGNORE_CLOCK=1 "FAKE_APT_UPDATE_FAIL=E: Release file for http://deb.debian.org/debian/dists/bookworm-updates/InRelease is not valid yet (invalid for another 1d 2h 45min). Updates for this repository will not be applied."
+  run_installer --yes
+  [ "$RC" -ne 0 ] || fail "a failing apt-get update must fail the install"
+  assert_equals "2" "$(printf '%s\n' "$OUT" | grep -c '^  sudo date -u -s "2026-10-30 15:50:00"$')" "the exact manual command is printed in the plan and again in the failure hint"
+  assert_equals "2" "$(printf '%s\n' "$OUT" | grep -c '^  journalctl -u systemd-timesyncd -n 20 --no-pager$')" "so are the diagnostics"
+  assert_not_contains "$OUT" "curl -sI http://google.com" "a measured hint never prints the generic command"
+  # With no reading to be had, the hint prints a command that finds the time itself.
+  w_ubuntu hint-generic
+  w_env FAKE_GITHUB_OFFLINE=1 "FAKE_APT_UPDATE_FAIL=E: Release file for http://deb.debian.org/debian/dists/bookworm-updates/InRelease is not valid yet (invalid for another 1d 2h 45min). Updates for this repository will not be applied."
+  run_installer --yes
+  [ "$RC" -ne 0 ] || fail "a failing apt-get update must fail the install"
+  local generic
+  generic=$(cat <<'EOF'
+  sudo date -s "$(curl -sI http://google.com | sed -n 's/^[Dd]ate: //p' | tr -d '\r')"
+EOF
+)
+  assert_contains "$OUT" "$generic" "the generic command reads the Date header of a plain http response"
+  assert_contains "$OUT" "That reads the time from a plain http response, because https certificate checks can fail while the clock is wrong." "it explains why it is plain http"
+  assert_not_contains "$OUT" "sudo date -u -s" "without a measurement there is no exact time to print"
+  assert_contains "$OUT" "  timedatectl timesync-status" "the diagnostics are still printed"
+  assert_contains "$OUT" "sudo timedatectl set-ntp true" "and so is the systemd fix"
+  pass "the clock hint gives a manual fallback with an exact time, or a command that finds it"
 }
 
 test_32_bit_arm_is_supported_or_refused_clearly() {
@@ -1261,6 +1294,7 @@ fm_test_run \
   test_a_real_run_stops_and_asks_when_the_clock_is_wrong \
   test_a_clock_check_that_cannot_run_never_blocks \
   test_a_package_failure_about_the_clock_gets_a_hint \
+  test_the_clock_hint_offers_a_manual_fallback_on_both_paths \
   test_32_bit_arm_is_supported_or_refused_clearly \
   test_script_runs_under_every_posix_shell \
   test_prompt_uses_the_controlling_terminal

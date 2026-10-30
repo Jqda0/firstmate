@@ -129,7 +129,10 @@ on_exit() {
     if [ -n "$WORK" ] && grep -Ei 'not valid yet|not yet valid' "$WORK/last.out" >/dev/null 2>&1; then
       warn ""
       warn "The output above says something is \"not valid yet\", which almost always means this machine's clock is behind real time."
-      clock_fix >&2
+      # Measure again for the exact time to set; without a reading the generic form is printed.
+      of_report=$(clock_skew_report 2>/dev/null || true)
+      of_rest=${of_report#*|}
+      clock_fix "${of_rest%%|*}" >&2
     fi
   fi
   if [ -n "$WORK" ]; then
@@ -138,11 +141,32 @@ on_exit() {
 }
 
 # How to repair a wrong clock, shared by the plan's warning and the failure hint.
+# $1 is the UTC time github.com reported ("2026-10-30 16:33:15"), or empty when
+# it could not be measured; with it the manual command is exact, without it the
+# command reads the time from a plain http response.
 clock_fix() {
-  printf '%s\n' \
-    "Fix the clock first. On a systemd machine run: sudo timedatectl set-ntp true" \
-    "then check that timedatectl status shows \"System clock synchronized: yes\". Without systemd, set the date and time by hand." \
-    "Then run this installer again."
+  cf_time=${1:-}
+  cat <<'EOF'
+Fix the clock first. On a systemd machine run: sudo timedatectl set-ntp true
+then check that timedatectl status shows "System clock synchronized: yes".
+If it does not synchronize, or there is no systemd, set the clock by hand:
+EOF
+  if [ -n "$cf_time" ]; then
+    printf '  sudo date -u -s "%s"\n' "$cf_time"
+    printf '%s\n' "That is the time github.com reported; it is a few seconds old by the time you run it, which does not matter for certificates and package indexes."
+  else
+    cat <<'EOF'
+  sudo date -s "$(curl -sI http://google.com | sed -n 's/^[Dd]ate: //p' | tr -d '\r')"
+That reads the time from a plain http response, because https certificate checks can fail while the clock is wrong.
+EOF
+  fi
+  cat <<'EOF'
+If the clock still will not sync, run these two and read the output:
+  timedatectl timesync-status
+  journalctl -u systemd-timesyncd -n 20 --no-pager
+A sync that never completes usually means the network blocks time servers (NTP on UDP port 123) or systemd-timesyncd is missing or not running.
+Then run this installer again.
+EOF
 }
 
 ensure_work() {
@@ -434,7 +458,7 @@ check_clock() {
   fi
   CLOCK_NOTE="Clock check: this machine's clock is $(fmt_span "$cc_abs") $cc_dir github.com (this machine says $cc_local UTC, github.com says $cc_remote UTC).
 A clock this far off makes package indexes and HTTPS downloads fail, for example with \"Release file ... is not valid yet\".
-$(clock_fix)"
+$(clock_fix "$cc_remote")"
 }
 
 need() {
