@@ -255,6 +255,69 @@ gh_version() {
   gh --version 2>/dev/null | clean_version
 }
 
+# The other executables named $1 that the shell would find on PATH behind the one
+# at $2, as "path version, path version", so a complaint about one node can show
+# the node the user's own terminal may run instead. A directory reached twice
+# (symlinked PATH entries) counts once, and at most five are listed.
+others_on_path() {
+  op_phys=$(cd -P "$(dirname "$2")" 2>/dev/null && pwd)
+  printf '%s\n' "$PATH" | tr ':' '\n' | {
+    op_seen=" $op_phys "
+    op_n=0
+    op_out=''
+    while IFS= read -r op_dir; do
+      [ -n "$op_dir" ] || continue
+      [ -x "$op_dir/$1" ] && [ ! -d "$op_dir/$1" ] || continue
+      op_p=$(cd -P "$op_dir" 2>/dev/null && pwd) || continue
+      case "$op_seen" in *" $op_p "*) continue ;; esac
+      op_seen="$op_seen$op_p "
+      op_v=$("$op_dir/$1" --version 2>/dev/null | clean_version)
+      op_out="${op_out:+$op_out, }$op_dir/$1 ${op_v:-(version unreadable)}"
+      op_n=$((op_n + 1))
+      [ "$op_n" -lt 5 ] || break
+    done
+    printf '%s' "$op_out"
+  }
+}
+
+# "; also on your PATH: ..." after a complaint about $1, or nothing.
+also_on_path() {
+  ao_path=$(command -v "$1" 2>/dev/null) || return 0
+  ao_list=$(others_on_path "$1" "$ao_path")
+  if [ -n "$ao_list" ]; then
+    printf '; also on your PATH: %s' "$ao_list"
+  fi
+}
+
+# What the shell finds for $1 and the version it reports, for messages.
+judged() {
+  jd_path=$(command -v "$1" 2>/dev/null) || jd_path=''
+  if [ -z "$jd_path" ]; then
+    printf 'not found'
+    return 0
+  fi
+  case "$1" in
+    node) jd_v=$(node_version) ;;
+    gh) jd_v=$(gh_version) ;;
+    *) jd_v='' ;;
+  esac
+  printf '%s %s' "$jd_path" "${jd_v:-(version unreadable)}"
+}
+
+# The installer sees programs on PATH, not shell functions, which is the usual
+# reason a tool that works in the user's terminal is reported missing.
+not_found_note() {
+  printf "The installer only sees programs on PATH, not shell functions such as a lazily loaded nvm, so if %s works in your terminal run: command -v %s  and report what it prints." "$1" "$1"
+}
+
+# A step that installs into LOCAL_BIN moves it ahead of everything else, so the
+# tools it just installed are the ones used for the rest of the run.
+put_local_bin_first() {
+  PATH="$LOCAL_BIN:$PATH"
+  export PATH
+  hash -r 2>/dev/null || true
+}
+
 # The version the platform's package manager would install for package $1, or
 # nothing when it cannot say (an apt index that was never refreshed, a name the
 # distribution does not carry).
@@ -518,13 +581,17 @@ detect_and_plan() {
   if ! have gh; then
     GH_NEEDED=1
     GH_STATE=missing
-    need "gh: not found"
+    need "gh: not found. $(not_found_note gh)"
   else
     dt_gh=$(gh_version)
     if ! version_ge "$dt_gh" "$GH_MIN"; then
       GH_NEEDED=1
       GH_STATE=old
-      need "gh: ${dt_gh:-unreadable version} is older than $GH_MIN, which firstmate's pull-request scripts need"
+      if [ -n "$dt_gh" ]; then
+        need "gh: $(judged gh) is older than $GH_MIN, which firstmate's pull-request scripts need$(also_on_path gh)"
+      else
+        need "gh: $(command -v gh) does not report a version this installer can read (needs $GH_MIN or newer)$(also_on_path gh)"
+      fi
     fi
   fi
 
@@ -533,17 +600,21 @@ detect_and_plan() {
   if ! have node; then
     NODE_NEEDED=1
     NODE_STATE=missing
-    need "node: not found (needs $NODE_MIN or newer)"
+    need "node: not found (needs $NODE_MIN or newer). $(not_found_note node)"
   else
     dt_node=$(node_version)
     if ! version_ge "$dt_node" "$NODE_MIN"; then
       NODE_NEEDED=1
       NODE_STATE=old
-      need "node: ${dt_node:-unreadable version} is older than $NODE_MIN, which quota-axi requires"
+      if [ -n "$dt_node" ]; then
+        need "node: $(judged node) is older than $NODE_MIN, which quota-axi requires$(also_on_path node)"
+      else
+        need "node: $(command -v node) does not report a version this installer can read (needs $NODE_MIN or newer)$(also_on_path node)"
+      fi
     elif ! have npm; then
       NODE_NEEDED=1
       NODE_STATE=missing
-      need "npm: not found (it ships with node)"
+      need "npm: not found next to node $(judged node) (it ships with node). $(not_found_note npm)"
     fi
   fi
 
@@ -782,14 +853,14 @@ verify_names() {
     case "$vn_t" in
       gh)
         vn_v=$(gh_version)
-        version_ge "$vn_v" "$GH_MIN" || die "gh is ${vn_v:-not found} after the install, but firstmate needs $GH_MIN or newer"
+        version_ge "$vn_v" "$GH_MIN" || die "gh is $(judged gh) after the install, but firstmate needs $GH_MIN or newer$(also_on_path gh)"
         ;;
       node|nodejs)
         vn_v=$(node_version)
         if [ -z "$vn_v" ] && have node; then
           die "node is installed but does not run: $(node --version 2>&1 | head -n 1)"
         fi
-        version_ge "$vn_v" "$NODE_MIN" || die "node is ${vn_v:-not found} after the install, but firstmate needs $NODE_MIN or newer"
+        version_ge "$vn_v" "$NODE_MIN" || die "node is $(judged node) after the install, but firstmate needs $NODE_MIN or newer$(also_on_path node)"
         have npm || die "npm is still not on PATH after the install"
         ;;
       procps|procps-ng) have ps || die "ps is still not on PATH after the install" ;;
@@ -909,6 +980,7 @@ step_node_tarball() {
     fi
     run ln -sf "$nt_dir/bin/$nt_bin" "$LOCAL_BIN/$nt_bin"
   done
+  put_local_bin_first
   verify_names node
 }
 
@@ -938,6 +1010,7 @@ step_npm_prefix() {
   run npm config set prefix "$np_want"
   np_new=$(npm config get prefix 2>/dev/null || true)
   [ "$np_new" = "$np_want" ] || die "npm still reports its global prefix as ${np_new:-nothing} instead of $np_want"
+  put_local_bin_first
 }
 
 step_clone() {
@@ -966,6 +1039,7 @@ step_toolchain() {
   # A subshell keeps FM_HOME from leaking into the rest of the install.
   # shellcheck disable=SC2086
   (FM_HOME="$INSTALL_DIR"; export FM_HOME; run "$INSTALL_DIR/bin/fm-bootstrap.sh" install $tc_missing)
+  put_local_bin_first
 }
 
 run_plan() {
@@ -1061,7 +1135,12 @@ path_advice() {
   esac
   [ "$pa_advise" = 1 ] || return 0
   say ""
-  say "Your PATH needs $LOCAL_BIN first, where node and the firstmate tools were installed."
+  if [ "$NODE_VIA" = tarball ]; then
+    pa_what="node and the firstmate tools were"
+  else
+    pa_what="the firstmate tools were"
+  fi
+  say "Your PATH needs $LOCAL_BIN first, where $pa_what installed."
   say "Add this line to your shell startup file (for example ~/.profile, ~/.bashrc, or ~/.zshrc), then open a new terminal:"
   # shellcheck disable=SC2016 # The line is printed for the user's startup file, not expanded here.
   say '  export PATH="$HOME/.local/bin:$PATH"'
@@ -1139,7 +1218,14 @@ main() {
   LOCAL_BIN="$HOME/.local/bin"
   NODE_LIB="$HOME/.local/lib/nodejs"
   detect_platform
-  PATH="$LOCAL_BIN:$PATH"
+  # Judge what is installed the way the user's shell resolves it. LOCAL_BIN goes
+  # last, so tools a previous run put there are still found, but a stale node in
+  # it cannot hide a good one earlier on PATH; when the user's PATH already has
+  # it, their order stands. A step that installs into it moves it to the front.
+  case ":$PATH:" in
+    *":$LOCAL_BIN:"*) ;;
+    *) PATH="$PATH:$LOCAL_BIN" ;;
+  esac
   export PATH
   detect_and_plan
   check_clock

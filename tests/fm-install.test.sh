@@ -687,12 +687,12 @@ test_version_floors_decide_what_is_installed() {
   w_tool gh 2.49.9
   w_tool node 22.18.9
   run_installer --dry-run
-  assert_contains "$OUT" "gh: 2.49.9 is older than 2.50.0, which firstmate's pull-request scripts need" "gh just below the floor is replaced"
-  assert_contains "$OUT" "node: 22.18.9 is older than 22.19.0, which quota-axi requires" "node just below the floor is replaced"
+  assert_contains "$OUT" "gh: $W/inst/gh 2.49.9 is older than 2.50.0, which firstmate's pull-request scripts need" "gh just below the floor is replaced, and the complaint names the gh it judged"
+  assert_contains "$OUT" "node: $W/inst/node 22.18.9 is older than 22.19.0, which quota-axi requires" "node just below the floor is replaced, and the complaint names the node it judged"
   w_tool node 26.13.0
   rm -f "$W/inst/npm"
   run_installer --dry-run
-  assert_contains "$OUT" "npm: not found" "a node without npm is not enough"
+  assert_contains "$OUT" "npm: not found next to node $W/inst/node 26.13.0 (it ships with node)." "a node without npm is not enough, and the complaint names the node"
   pass "node 22.19.0 and gh 2.50.0 are the floors, and a version below them is replaced"
 }
 
@@ -1165,6 +1165,86 @@ EOF
   pass "the clock hint gives a manual fallback with an exact time, or a command that finds it"
 }
 
+# --- judging tools the way the user's shell resolves them -----------------------
+
+# A node of its own in ~/.local/bin that reports <version>.
+w_local_node() {
+  mkdir -p "$W/home/.local/bin"
+  printf '#!/bin/sh\necho v%s\n' "$1" > "$W/home/.local/bin/node"
+  chmod +x "$W/home/.local/bin/node"
+}
+
+test_a_stale_node_in_local_bin_cannot_hide_a_good_one() {
+  # The user's shell never looks in ~/.local/bin, so it runs the good node.
+  w_ubuntu stale-not-on-path
+  w_base
+  w_local_node 22.14.0
+  w_env FAKE_BOOTSTRAP_TOOLS=""
+  run_installer --dry-run
+  assert_not_contains "$OUT" "node:" "a stale node in a directory the shell does not search is not judged"
+  assert_not_contains "$OUT" "Install the current Node.js LTS" "and no node is installed over it"
+  # On the user's PATH but behind the good node: their shell still runs the good one.
+  w_ubuntu stale-behind
+  w_base
+  w_local_node 22.14.0
+  w_env FAKE_BOOTSTRAP_TOOLS="" "PATH=$W/stubs:$W/inst:$W/basic:$W/home/.local/bin"
+  run_installer --dry-run
+  assert_not_contains "$OUT" "node:" "a stale node behind the good one on PATH is not judged either"
+  # In front of the good node: their shell runs the stale one, so it is judged, and named.
+  w_ubuntu stale-first
+  w_base
+  w_local_node 22.14.0
+  w_env FAKE_BOOTSTRAP_TOOLS="" "PATH=$W/home/.local/bin:$W/stubs:$W/inst:$W/basic"
+  run_installer --dry-run
+  assert_contains "$OUT" "node: $W/home/.local/bin/node 22.14.0 is older than 22.19.0, which quota-axi requires; also on your PATH: $W/inst/node 26.13.0" "the complaint names the node it judged, its version, and the other node on PATH"
+  assert_contains "$OUT" "Install the current Node.js LTS" "and the stale one is replaced"
+  pass "a stale node in ~/.local/bin is judged only when the user's own PATH would run it"
+}
+
+test_a_node_found_only_after_the_install_wins() {
+  w_ubuntu old-node-elsewhere
+  w_base 2.103.0 18.19.1
+  w_env FAKE_BOOTSTRAP_TOOLS=""
+  run_installer --yes
+  expect_code 0 "$RC" "the install exits 0:"$'\n'"$OUT"
+  assert_contains "$OUT" "node: $W/inst/node 18.19.1 is older than 22.19.0, which quota-axi requires" "the old node on PATH is judged first"
+  assert_equals "v26.13.0" "$(PATH="$W/home/.local/bin:$W/stubs:$W/inst:$W/basic" "$W/home/.local/bin/node" --version)" "the new node is linked in ~/.local/bin"
+  assert_contains "$OUT" "Everything firstmate needs is installed." "the run judged the new node, not the old one, once it was installed"
+  assert_contains "$OUT" "Your PATH needs $W/home/.local/bin first, where node and the firstmate tools were installed." "the user is told to put ~/.local/bin first so their shell runs it too"
+  pass "a node installed into ~/.local/bin wins for the rest of the run"
+}
+
+test_a_missing_node_names_what_the_installer_can_see() {
+  w_ubuntu no-node
+  run_installer --dry-run
+  assert_contains "$OUT" "node: not found (needs 22.19.0 or newer). The installer only sees programs on PATH, not shell functions such as a lazily loaded nvm, so if node works in your terminal run: command -v node  and report what it prints." "the node complaint says what the installer can and cannot see"
+  w_ubuntu no-gh
+  w_base
+  rm -f "$W/inst/gh"
+  run_installer --dry-run
+  assert_contains "$OUT" "gh: not found. The installer only sees programs on PATH" "gh gets the same sentence"
+  pass "a tool that is not found says the installer only sees programs on PATH"
+}
+
+test_the_node_floor_judges_every_version_correctly() {
+  local row ver verdict i=0
+  for row in "22.14.0 old" "22.18.9 old" "22.19.0 ok" "22.19.1 ok" "23.0.0 ok" "24.0.0 ok" "26.12.1 ok" "26.13.0 ok"; do
+    i=$((i + 1))
+    ver=${row% *}
+    verdict=${row#* }
+    w_ubuntu "floor-$i"
+    w_base 2.103.0 "$ver"
+    w_env FAKE_BOOTSTRAP_TOOLS=""
+    run_installer --dry-run
+    if [ "$verdict" = old ]; then
+      assert_contains "$OUT" "node: $W/inst/node $ver is older than 22.19.0" "node $ver is below the floor"
+    else
+      assert_not_contains "$OUT" "node:" "node $ver meets the floor"
+    fi
+  done
+  pass "node 22.14.0 and 22.18.9 are old; 22.19.0 and anything newer are accepted"
+}
+
 test_32_bit_arm_is_supported_or_refused_clearly() {
   w_ubuntu arm32
   w_env FAKE_UNAME_M=armv7l
@@ -1295,6 +1375,10 @@ fm_test_run \
   test_a_clock_check_that_cannot_run_never_blocks \
   test_a_package_failure_about_the_clock_gets_a_hint \
   test_the_clock_hint_offers_a_manual_fallback_on_both_paths \
+  test_a_stale_node_in_local_bin_cannot_hide_a_good_one \
+  test_a_node_found_only_after_the_install_wins \
+  test_a_missing_node_names_what_the_installer_can_see \
+  test_the_node_floor_judges_every_version_correctly \
   test_32_bit_arm_is_supported_or_refused_clearly \
   test_script_runs_under_every_posix_shell \
   test_prompt_uses_the_controlling_terminal
